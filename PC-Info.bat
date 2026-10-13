@@ -32,7 +32,9 @@ echo.
 echo  ======================================================================
 echo                            PC INFO TOOL  v1.0
 echo  ======================================================================
-echo    Computer: %COMPUTERNAME%     User: %USERNAME%     Administrator: %ADMIN%
+setlocal EnableDelayedExpansion
+echo    Computer: !COMPUTERNAME!     User: !USERNAME!     Administrator: !ADMIN!
+endlocal
 echo  ----------------------------------------------------------------------
 echo    HARDWARE                              SYSTEM
 echo    [1] Processor (CPU)                   [7] System overview
@@ -42,8 +44,8 @@ echo    [4] Motherboard and BIOS              [A] Performance, top processes
 echo    [5] Storage (disks and drives)        [B] Installed programs, startup
 echo    [6] Battery                           [C] Devices and drivers
 echo  ----------------------------------------------------------------------
-echo    [R] Create full report (HTML + TXT on the Desktop)
-if "%ADMIN%"=="No" echo    [U] Restart as administrator (shows TPM, BitLocker, disk health)
+echo    [R] Create full report (HTML + TXT, you choose the file name)
+if "%ADMIN%"=="No" echo    [U] Restart as administrator ^(shows TPM, BitLocker, disk health^)
 echo    [0] Exit
 echo  ======================================================================
 echo.
@@ -146,7 +148,7 @@ function Format-Date($Date, [switch]$DateOnly) {
 }
 
 function Format-Duration([timespan]$Span) {
-    '{0} days, {1} h, {2} min' -f $Span.Days, $Span.Hours, $Span.Minutes
+    '{0} d {1} h {2} min' -f $Span.Days, $Span.Hours, $Span.Minutes
 }
 
 function Format-Cache($KB) {
@@ -765,16 +767,89 @@ function ConvertTo-HtmlBlock($Block) {
     $html.ToString()
 }
 
-function New-Report {
-    $folder = [Environment]::GetFolderPath('Desktop')
-    if (-not $folder -or -not (Test-Path -LiteralPath $folder)) { $folder = $env:USERPROFILE }
-    $folder = Join-Path $folder 'PC-Reports'
-    New-Item -ItemType Directory -Path $folder -Force | Out-Null
-    $created = Get-Date
-    $base = Join-Path $folder ('PC-Report_{0}_{1}' -f $env:COMPUTERNAME, $created.ToString('yyyy-MM-dd_HH-mm'))
+# Report fields that identify this PC or its owner. Hidden when the user asks for it.
+$PrivateFields = 'Computer', 'Computer name', 'Current user', 'Serial number', 'System serial number', 'Serial',
+    'Processor ID', 'MAC address', 'IPv4 address', 'Default gateway', 'DNS servers', 'Wi-Fi network (SSID)'
+$PrivateChecks = 'Administrator accounts'
 
+function Hide-PrivateData($Rows) {
+    $names = @($env:USERNAME, $env:USERDOMAIN, $env:COMPUTERNAME) | Where-Object { $_ -and $_.Length -ge 3 } |
+        Sort-Object -Unique | ForEach-Object { [regex]::Escape($_) }
+    foreach ($row in $Rows) {
+        foreach ($p in $row.PSObject.Properties) {
+            if ($PrivateFields -contains $p.Name -or ($p.Name -eq 'Value' -and $PrivateChecks -contains $row.Check)) {
+                $p.Value = '[hidden]'
+            } elseif ($p.Value -is [string]) {
+                # e.g. C:\Users\<name>\... inside startup commands
+                foreach ($n in $names) { $p.Value = $p.Value -replace $n, '[hidden]' }
+            }
+        }
+    }
+}
+
+# Turns whatever the user typed into a safe file name: no folders, no
+# characters Windows forbids, no reserved device names, limited length.
+function Get-SafeFileName([string]$Name) {
+    $clean = ("$Name".Trim() -replace '\.(html?|txt)$', '') -replace '[\\/:*?"<>|\x00-\x1F]', '_'
+    $clean = $clean.Trim([char[]]' .')
+    if ($clean.Length -gt 100) { $clean = $clean.Substring(0, 100).Trim([char[]]' .') }
+    if ($clean -match '^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?$') { $clean = '_' + $clean }
+    $clean
+}
+
+# Asks for the report name and returns the full path without extension.
+function Read-ReportPath([string]$Folder, [string]$DefaultName) {
+    while ($true) {
+        Write-Host ''
+        Write-Host '  Type a name for the report file, or just press Enter to use:'
+        Write-Host "    $DefaultName" -ForegroundColor DarkGray
+        $typed = "$(Read-Host '  File name')".Trim()
+        if (-not $typed) {
+            $name = $DefaultName
+        } else {
+            $name = Get-SafeFileName $typed
+            if (-not $name) {
+                Write-Host '  This name cannot be used. Please type another one.' -ForegroundColor Red
+                continue
+            }
+            if ($name -ne ($typed -replace '\.(html?|txt)$', '')) {
+                Write-Host "  Some characters are not allowed in file names. The name will be: $name" -ForegroundColor Yellow
+            }
+        }
+        $path = Join-Path $Folder $name
+        if ([IO.File]::Exists("$path.html") -or [IO.File]::Exists("$path.txt")) {
+            $answer = Read-Host "  A report named '$name' already exists. Replace it? (Y/N)"
+            if ($answer -notmatch '^[yY]') { continue }
+        }
+        return $path
+    }
+}
+
+function New-Report {
     Write-Host ''
     Write-Host '  ===== CREATING FULL REPORT =====' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  The report can contain private details: user and computer name, serial'
+    Write-Host '  numbers, IP and MAC addresses, Wi-Fi name. Hide them if you plan to share it.'
+    $hidePrivate = (Read-Host '  Hide private details? (Y/N)') -match '^[yY]'
+
+    $folder = [Environment]::GetFolderPath('Desktop')
+    if (-not $folder -or -not [IO.Directory]::Exists($folder)) { $folder = $env:USERPROFILE }
+    $folder = Join-Path $folder 'PC-Reports'
+    try {
+        [void][IO.Directory]::CreateDirectory($folder)
+    } catch {
+        Write-Host "  Could not create the folder $folder" -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    $created = Get-Date
+    $defaultName = if ($hidePrivate) { 'PC-Report_' + $created.ToString('yyyy-MM-dd_HH-mm') }
+        else { Get-SafeFileName ('PC-Report_{0}_{1}' -f $env:COMPUTERNAME, $created.ToString('yyyy-MM-dd_HH-mm')) }
+    $base = Read-ReportPath $folder $defaultName
+
+    Write-Host ''
+    Write-Host '  Collecting information, please wait...' -ForegroundColor DarkGray
     Write-Host '  [ 0] Quick summary...'
     $summary = Get-QuickSummary
     $results = New-Object System.Collections.Generic.List[object]
@@ -784,17 +859,24 @@ function New-Report {
         Write-Host ('  [{0,2}/{1}] {2}...' -f $n, $Sections.Count, $Sections[$key].Name)
         $results.Add([pscustomobject]@{ Key = $key; Name = $Sections[$key].Name; Blocks = (Get-SectionBlocks $key) })
     }
+    if ($hidePrivate) {
+        Hide-PrivateData $summary
+        foreach ($r in $results) { foreach ($b in $r.Blocks) { Hide-PrivateData $b.Data } }
+    }
 
-    # Every row marked WARN anywhere in the report is listed at the top.
+    # Every row marked WARN (or a disk that is not healthy) is listed at the top.
     $warnings = @(foreach ($r in $results) {
         foreach ($row in ($r.Blocks | ForEach-Object { $_.Data })) {
-            if ($row.Status -eq 'WARN') {
+            if ($row.Status -eq 'WARN' -or "$($row.Health)" -match '^(Warning|Unhealthy)$') {
                 $values = @($row.PSObject.Properties | Where-Object { $_.Name -ne 'Status' } | ForEach-Object { $_.Value })
                 '{0}: {1} - {2}' -f $r.Name, $values[0], $values[-1]
             }
         }
     })
     $adminText = if ($IsAdmin) { 'Yes' } else { 'No' }
+    $userText = if ($hidePrivate) { '[hidden]' } else { $env:USERDOMAIN + '\' + $env:USERNAME }
+    $privacyNote = if ($hidePrivate) { 'Private details are hidden in this report.' }
+        else { 'This report contains private details about this PC. Share it only with people you trust.' }
 
     # ---- TXT report
     $txt = New-Object System.Text.StringBuilder
@@ -802,9 +884,10 @@ function New-Report {
     [void]$txt.AppendLine($line)
     [void]$txt.AppendLine(' PC INFORMATION REPORT')
     [void]$txt.AppendLine(' Created       : ' + $created.ToString('yyyy-MM-dd HH:mm'))
-    [void]$txt.AppendLine(' User          : ' + $env:USERDOMAIN + '\' + $env:USERNAME)
+    [void]$txt.AppendLine(' User          : ' + $userText)
     [void]$txt.AppendLine(' Administrator : ' + $adminText)
     [void]$txt.AppendLine(' Tool          : PC Info Tool v' + $ToolVersion)
+    [void]$txt.AppendLine(' Note          : ' + $privacyNote)
     [void]$txt.AppendLine($line)
     [void]$txt.AppendLine('')
     [void]$txt.AppendLine('##### QUICK SUMMARY #####')
@@ -831,7 +914,7 @@ function New-Report {
     $attention = if ($warnings.Count) {
         '<ul class="warnlist">' + (($warnings | ForEach-Object { '<li>' + (ConvertTo-HtmlText $_) + '</li>' }) -join '') + '</ul>'
     } else { '<p class="good">No problems found.</p>' }
-    $title = 'PC Report - ' + $env:COMPUTERNAME
+    $title = if ($hidePrivate) { 'PC Report' } else { 'PC Report - ' + $env:COMPUTERNAME }
 
     $css = @'
 :root { --bg:#f4f6fa; --card:#ffffff; --text:#1d2433; --muted:#6b7385; --line:#e3e7ef; --head:#f0f3f8;
@@ -867,20 +950,29 @@ footer { text-align:center; color:var(--muted); padding:24px 16px; }
 @media print { nav { display:none; } section { break-inside:avoid; border:none; } }
 '@
 
+    # The page has no scripts and loads nothing from outside; the policy below enforces that.
     $html = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+        "<meta http-equiv=""Content-Security-Policy"" content=""default-src 'none'; style-src 'unsafe-inline'"">" +
         '<meta name="viewport" content="width=device-width, initial-scale=1">' +
         '<title>' + (ConvertTo-HtmlText $title) + '</title><style>' + $css + '</style></head><body>' +
         '<header><h1>' + (ConvertTo-HtmlText $title) + '</h1><p>Created ' + $created.ToString('yyyy-MM-dd HH:mm') +
-        ' &middot; User ' + (ConvertTo-HtmlText ($env:USERDOMAIN + '\' + $env:USERNAME)) + ' &middot; Administrator: ' + $adminText + '</p></header>' +
+        ' &middot; User ' + (ConvertTo-HtmlText $userText) + ' &middot; Administrator: ' + $adminText + '</p></header>' +
         '<nav><a href="#summary">Summary</a>' + $nav + '</nav><main>' +
         '<section id="summary"><h2>Quick summary</h2>' + (ConvertTo-HtmlBlock (New-Block '' $summary)) +
         '<h3>Needs attention (' + $warnings.Count + ')</h3>' + $attention + '</section>' +
         $sectionsHtml +
-        '</main><footer>PC Info Tool v' + $ToolVersion + ' &middot; read-only report, no settings were changed</footer></body></html>'
+        '</main><footer>PC Info Tool v' + $ToolVersion + ' &middot; read-only report, no settings were changed<br>' + (ConvertTo-HtmlText $privacyNote) + '</footer></body></html>'
 
-    $utf8 = New-Object System.Text.UTF8Encoding($true)
-    [IO.File]::WriteAllText("$base.html", $html, $utf8)
-    [IO.File]::WriteAllText("$base.txt", $txt.ToString(), $utf8)
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($true)
+        [IO.File]::WriteAllText("$base.html", $html, $utf8)
+        [IO.File]::WriteAllText("$base.txt", $txt.ToString(), $utf8)
+    } catch {
+        Write-Host ''
+        Write-Host '  The report could not be saved:' -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
 
     Write-Host ''
     Write-Host '  Report saved:' -ForegroundColor Green
@@ -888,6 +980,10 @@ footer { text-align:center; color:var(--muted); padding:24px 16px; }
     Write-Host "    $base.txt"
     if ($warnings.Count) { Write-Host ('  Items that need attention: {0}' -f $warnings.Count) -ForegroundColor Red }
     Write-Host ''
-    $answer = Read-Host '  Open the HTML report now? (Y/N)'
-    if ($answer -match '^[yY]') { Start-Process -FilePath "$base.html" }
+    $answer = Read-Host '  Open it now? [H] HTML report  [T] text report  [F] folder  [N] no'
+    switch -Regex ($answer) {
+        '^[hH]' { Start-Process -FilePath "$base.html" }
+        '^[tT]' { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}.txt"' -f $base) }
+        '^[fF]' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}.html"' -f $base) }
+    }
 }
